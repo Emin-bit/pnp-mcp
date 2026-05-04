@@ -1,0 +1,29 @@
+{
+  "_comment": "Drop the relevant pnp entry into the mcpServers object of your Claude Desktop config. Path: macOS ~/Library/Application Support/Claude/claude_desktop_config.json — Windows %APPDATA%\\Claude\\claude_desktop_config.json. Restart Claude Desktop after editing.",
+
+  "mcpServers": {
+    "pnp": {
+      "command": "pnp-mcp"
+    },
+
+    "pnp-via-npx": {
+      "_comment": "Same effect, no global install needed.",
+      "command": "npx",
+      "args": ["-y", "@emin-bit/pnp-mcp"]
+    },
+
+    "pnp-unsafe": {
+      "_comment": "DANGEROUS: skips the destructive-command gate. Only for fully-automated trusted pipelines. Treat like rm -rf /.",
+      "command": "pnp-mcp",
+      "env": { "PNP_MCP_SAFE_MODE": "off" }
+    },
+
+    "pnp-with-pnp-managed-identity": {
+      "_comment": "Pre-set ManagedIdentity client id so pnp_auth_connect_managed_identity picks the right user-assigned MI. Only useful when running on an Azure VM / App Service.",
+      "command": "pnp-mcp",
+      "env": {
+        "PNP_MCP_LOG_DIR": "/var/log/pnp-mcp"
+      }
+    }
+  }
+}

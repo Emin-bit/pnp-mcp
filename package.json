@@ -1,0 +1,65 @@
+{
+  "name": "@emin-bit/pnp-mcp",
+  "version": "1.0.0",
+  "description": "MCP (Model Context Protocol) server bridging Claude with the PnP PowerShell module for SharePoint Online and Microsoft 365 administration. Wraps `pwsh` 7+ with PnP.PowerShell module installed; exposes auth lifecycle, sites/webs/lists/files/content-types/permissions/provisioning operations as typed tools, plus a generic passthrough escape hatch.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Emin Mujabašić",
+  "homepage": "https://github.com/Emin-bit/pnp-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Emin-bit/pnp-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Emin-bit/pnp-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-desktop",
+    "anthropic",
+    "pnp",
+    "pnp-powershell",
+    "sharepoint",
+    "sharepoint-online",
+    "microsoft-365",
+    "m365",
+    "powershell",
+    "pwsh",
+    "office-365",
+    "tenant-admin",
+    "provisioning"
+  ],
+  "bin": {
+    "pnp-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "examples"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node smoke-test.mjs",
+    "verify-enums": "node verify-enums.mjs",
+    "prepublishOnly": "npm run clean && npm run test && npm run verify-enums"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}

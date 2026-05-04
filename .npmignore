@@ -1,0 +1,25 @@
+# Source — only ship compiled dist/
+src/
+tsconfig.json
+
+# Tests / dev
+smoke-test.mjs
+.claude/
+.git/
+.gitignore
+.DS_Store
+**/.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+
+# CI / coverage
+.github/
+.nyc_output/
+coverage/
