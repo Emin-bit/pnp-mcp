@@ -2,6 +2,28 @@
 
 All notable changes to `@emin-bit/pnp-mcp` are documented in this file. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — Phase A bug-fix patch
+
+First-contact UX fixes driven by a real Windows user's test session. No breaking changes; same 90 tools, same API.
+
+### Fixed
+
+- **A1 — Version-aware `Import-Module` in pwsh warmup.** The previous `Import-Module PnP.PowerShell` by name could pick up a legacy 2.x install from `~/Documents/WindowsPowerShell/Modules/` because PSModulePath order puts user-scope first, even when 3.x was installed system-wide. PnP MCP requires 3.x, so the warmup now enumerates all available installs, filters `Major -ge 3`, and imports the highest 3.x **by path**. If only 2.x is found, the error message names the offending versions and their on-disk locations instead of the generic "module not installed" line.
+- **A2 — Surface raw pwsh stdout/stderr/exit-code in warmup errors.** The previous opaque `pwsh warmup unexpected output: .` line gave users no clue what was wrong. The new error message includes the actual pwsh output, exit code, and any captured exception, and the full result is also written to the JSON log file at `~/.pnp-mcp/logs/pnp-mcp-YYYY-MM-DD.log` for post-mortem inspection.
+- **A3 — `setup_install_pnp_module` and the `setup` CLI now try `Install-PSResource` first**, falling back to `Install-Module` only if PSResourceGet 1.x is unavailable (pwsh < 7.4) or errors out. PSResourceGet is roughly 15× faster than the legacy installer and is significantly more resilient to PowerShellGet 2.x edge cases (NuGet provider re-bootstrap failures, `Set-PSRepository` load errors).
+- **A4 — Server announces log file location at startup.** Claude Desktop's `mcp-server-pnp.log` only contains MCP protocol traffic, not pwsh output or our internal logs. The server now writes `[pnp-mcp] v1.0.1 started — logs at <path>` to stderr at startup so users hunting for diagnostics know exactly where to look.
+
+### Added
+
+- **A6 — Update notifications via `update-notifier`.** The server checks the npm registry at most once per 24 hours (in a background process; cached state in `~/.config/configstore/`). When a newer version is published, the next server start prints a single plain-text banner to stderr — no auto-install, no boxen TTY decoration, just `Update available: 1.0.1 → 1.0.2 (patch). Run \`npm i -g @emin-bit/pnp-mcp\` then restart Claude Desktop.` Set `PNP_MCP_DISABLE_UPDATE_CHECK=1` in the MCP server env to silence.
+- **Preflight tightening.** `probePnpModule` now distinguishes "no install" from "only legacy 2.x install" — the latter reports `error` instead of `ok`, with a clear "PnP MCP requires 3.x" detail. When 3.x is installed, the probe also reports the on-disk module base path, so Windows users with both 2.x and 3.x installed can confirm which one is being picked.
+
+### Tests
+
+5 new regression tests (77/77 total): A4 stderr announcement, A1 version-aware warmup markers, A2 raw-stdout/stderr surfacing, A3 Install-PSResource ordering, A6 update-notifier wiring.
+
+[1.0.1]: https://github.com/Emin-bit/pnp-mcp/releases/tag/v1.0.1
+
 ## [1.0.0] — Initial release
 
 The first stable release. 90 tools across 5 phases of SharePoint Online + M365 administration, plus the `pnp_run` passthrough escape hatch and `pnp_help` discovery tool. Built and shipped after a per-phase agent code-review cycle that caught and fixed 30+ live-PnP-enum and parameter-shape issues against `PnP.PowerShell` 3.1.

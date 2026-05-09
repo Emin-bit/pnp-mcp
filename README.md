@@ -86,6 +86,25 @@ Or with `npx` (no global install needed):
 
 Restart Claude Desktop, and the 90 PnP tools become available.
 
+### Auto-update notifications
+
+The server checks the npm registry at most once per 24 hours (background, cached). When a newer version is found, the next launch prints a plain-text banner to stderr with the upgrade command. Set `"env": { "PNP_MCP_DISABLE_UPDATE_CHECK": "1" }` in the MCP entry to silence.
+
+For users who'd rather have updates pulled automatically (with a 1–3 second cold-start cost), use the `npx ... @latest` form:
+
+```json
+{
+  "mcpServers": {
+    "pnp": {
+      "command": "npx",
+      "args": ["-y", "@emin-bit/pnp-mcp@latest"]
+    }
+  }
+}
+```
+
+`npx` will check for and install a newer version on every Claude Desktop launch. Note: a server restart is still required to load the new code, but Claude Desktop already restarts MCP servers on each app start.
+
 ### Disabling safe-mode (NOT recommended)
 
 Destructive cmdlets are gated behind `confirm: true` by default. If you really want to skip the gate (e.g. for fully automated pipelines), set:

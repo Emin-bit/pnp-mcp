@@ -26,7 +26,7 @@ import { registerM365Group } from "./tools/m365group.js";
 import { registerNavigation } from "./tools/navigation.js";
 import { log, getLogDir } from "./logger.js";
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.0.1";
 
 const SERVER_INSTRUCTIONS = `
 PnP MCP server (90 tools). Wraps the PnP.PowerShell module via a long-lived pwsh 7+ REPL session.
@@ -265,6 +265,11 @@ export async function startServer(): Promise<void> {
     platform: process.platform,
     node: process.version,
   });
+  // A4 fix: Claude Desktop's `mcp-server-pnp.log` only captures MCP protocol traffic, not
+  // pwsh stderr or our internal log lines. Print our log path to MCP-server stderr at
+  // startup so users hunting for diagnostics know exactly where to look. Claude Desktop
+  // captures stderr too — this line ends up in `mcp.log`, which is the right place for it.
+  process.stderr.write(`[pnp-mcp] v${VERSION} started — logs at ${getLogDir()}\n`);
 }
 
 // Helper for smoke-test introspection: also export a function that just runs one command

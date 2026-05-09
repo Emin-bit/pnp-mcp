@@ -126,13 +126,24 @@ function pwshInstallHint(): string {
 }
 
 export async function probePnpModule(): Promise<Probe> {
+  // Match the runtime warmup logic in pwsh.ts: this server requires 3.x. Report any
+  // 2.x-only install as `error`, not `ok`, so preflight stays consistent with the
+  // version-aware Import-Module the warmup actually executes. Otherwise users see a
+  // green preflight then a confusing WARMUP_NEEDS_3X failure when the server starts.
   const bin = resolvePwsh();
   const r = await runOnce(
     bin,
     [
       "-NoProfile",
       "-Command",
-      "$m = Get-Module -ListAvailable PnP.PowerShell | Sort-Object Version -Descending | Select-Object -First 1; if ($m) { $m.Version.ToString() } else { 'NONE' }",
+      // Emit `BEST3:<version>|<base>`, `LEGACY:<v1>;<v2>;...`, or `NONE`.
+      "$all = Get-Module -ListAvailable PnP.PowerShell | Sort-Object Version -Descending; " +
+      "if (-not $all) { 'NONE' } " +
+      "else { " +
+      "  $best3 = $all | Where-Object { $_.Version.Major -ge 3 } | Select-Object -First 1; " +
+      "  if ($best3) { 'BEST3:' + $best3.Version.ToString() + '|' + $best3.ModuleBase } " +
+      "  else { 'LEGACY:' + (($all | ForEach-Object { $_.Version.ToString() }) -join ';') } " +
+      "}",
     ],
     30_000,
   );
@@ -146,9 +157,33 @@ export async function probePnpModule(): Promise<Probe> {
       name: "PnP.PowerShell module",
       status: "missing",
       detail: "module not installed",
-      fix: `Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser`,
+      fix: `Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser  (or older pwsh: Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser)`,
     };
   }
+  if (out.startsWith("LEGACY:")) {
+    const versions = out.slice("LEGACY:".length);
+    return {
+      name: "PnP.PowerShell module",
+      status: "error",
+      version: versions,
+      detail: `Only legacy 2.x installed (${versions}). PnP MCP requires 3.x. The server will fail to start until 3.x is installed alongside or replaces 2.x.`,
+      fix: `Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser  (PSResourceGet 1.x — modern, fast). On older pwsh: Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser`,
+    };
+  }
+  if (out.startsWith("BEST3:")) {
+    const rest = out.slice("BEST3:".length);
+    const [version, base] = rest.split("|");
+    return {
+      name: "PnP.PowerShell module",
+      status: "ok",
+      version,
+      // Surface the on-disk path so users on Windows with both 2.x and 3.x installed know
+      // which install is being picked. Resolves UX gap from the 1.0.0 Windows test report.
+      detail: base ? `loaded from ${base.trim()}` : undefined,
+    };
+  }
+  // Unknown output (very old pwsh / quoting glitch) — best-effort: treat as the version
+  // string itself and assume 3.x. Should never happen in practice with the new script.
   return { name: "PnP.PowerShell module", status: "ok", version: out };
 }
 
@@ -241,7 +276,8 @@ export async function installPnpModule(): Promise<{ prereqs: PrereqGateResult; i
       prereqs,
       install: {
         package: PNP_PS_MODULE,
-        command: `Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser`,
+        // Keep this consistent with the actual installer the server would run if needed.
+        command: `Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser  (with Install-Module fallback)`,
         exitCode: 0,
         alreadyInstalled: true,
         stdout: `${PNP_PS_MODULE} v${probe.version} already installed; skipping.`,
@@ -250,21 +286,54 @@ export async function installPnpModule(): Promise<{ prereqs: PrereqGateResult; i
     };
   }
 
+  // A3 fix: prefer Install-PSResource (PSResourceGet 1.x, ships with pwsh ≥ 7.4) — it's
+  // ~15× faster than Install-Module and is more resilient to the PowerShellGet 2.x edge
+  // cases (NuGet provider re-bootstrap failures, Set-PSRepository load errors). Fall back
+  // to Install-Module on older pwsh that lacks PSResourceGet, or if PSResourceGet itself
+  // errors out for some reason.
+  //
+  // Both branches finish by emitting `INSTALLED:<version>` so callers can verify success.
   const bin = resolvePwsh();
+  const installScript = [
+    "$ErrorActionPreference='Stop';",
+    "$installed=$false;",
+    "$method='';",
+    "$attemptErr='';",
+    // Try modern installer first.
+    "if (Get-Command Install-PSResource -ErrorAction SilentlyContinue) {",
+    "  try {",
+    `    Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser -TrustRepository -Reinstall -ErrorAction Stop;`,
+    "    $installed=$true; $method='Install-PSResource'",
+    "  } catch {",
+    "    $attemptErr = 'Install-PSResource failed: ' + $_.Exception.Message",
+    "  }",
+    "}",
+    // Fallback to legacy installer.
+    "if (-not $installed) {",
+    "  try {",
+    `    Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop;`,
+    "    $installed=$true; $method='Install-Module'",
+    "  } catch {",
+    "    $attemptErr = $attemptErr + ' | Install-Module failed: ' + $_.Exception.Message",
+    "  }",
+    "}",
+    "if ($installed) {",
+    `  $v = Get-Module -ListAvailable ${PNP_PS_MODULE} | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version;`,
+    "  Write-Output ('INSTALLED:' + $v.ToString() + '|via:' + $method)",
+    "} else {",
+    "  Write-Error $attemptErr; exit 1",
+    "}",
+  ].join(" ");
   const r = await runOnce(
     bin,
-    [
-      "-NoProfile",
-      "-Command",
-      `Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser; Get-Module -ListAvailable ${PNP_PS_MODULE} | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version | ForEach-Object { 'INSTALLED:' + $_.ToString() }`,
-    ],
+    ["-NoProfile", "-Command", installScript],
     10 * 60_000,
   );
   return {
     prereqs,
     install: {
       package: PNP_PS_MODULE,
-      command: `Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser`,
+      command: `Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser  (with Install-Module fallback)`,
       exitCode: r.exitCode,
       alreadyInstalled: false,
       stdout: r.stdout,
@@ -304,8 +373,8 @@ export async function runSetupCli(): Promise<void> {
 
   out("Phase 2 — Auto-install PnP.PowerShell module");
   out("─────────────────────────────────────────────────────────");
-  out(`Installs into your CurrentUser scope (no admin required). Runs:`);
-  out(`  pwsh -Command "Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser"\n`);
+  out(`Installs into your CurrentUser scope (no admin required). Tries Install-PSResource`);
+  out(`first (faster, more reliable on pwsh 7.4+), falls back to Install-Module if needed.\n`);
 
   const res = await installPnpModule();
   if (!res.prereqs.ok) {

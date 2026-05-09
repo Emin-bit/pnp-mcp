@@ -209,26 +209,83 @@ export class PwshSession {
       });
 
       // Pre-warm: import the PnP module so first auth call doesn't pay the cost.
-      // If module not installed, fail fast with clear install hint.
+      //
+      // Version-aware load (A1 fix): on Windows, `Import-Module PnP.PowerShell` by name can
+      // pick up a legacy 2.x install from the user-scope WindowsPowerShell modules dir even
+      // when 3.x is installed in the system-wide pwsh 7 dir, because PSModulePath order puts
+      // user-scope first. This server requires PnP 3.x, so we explicitly find the highest
+      // version with Major >= 3 and import it BY PATH. If only 2.x is present we fail with a
+      // structured error that names the offending versions and their on-disk locations,
+      // instead of the generic "module not installed" the prior code emitted.
+      const warmupCmd = [
+        "$ErrorActionPreference='Stop';",
+        "$all = Get-Module -ListAvailable PnP.PowerShell | Sort-Object Version -Descending;",
+        "if (-not $all) {",
+        "  Write-Output 'WARMUP_NOT_INSTALLED';",
+        "  return",
+        "}",
+        "$best = $all | Where-Object { $_.Version.Major -ge 3 } | Select-Object -First 1;",
+        "if (-not $best) {",
+        "  $vs = ($all | ForEach-Object { '{0} @ {1}' -f $_.Version, $_.ModuleBase }) -join '; ';",
+        "  Write-Output ('WARMUP_NEEDS_3X|' + $vs);",
+        "  return",
+        "}",
+        "Import-Module $best.Path -ErrorAction Stop;",
+        "Write-Output ('WARMUP_OK|' + $best.Version + '|' + $best.ModuleBase);",
+      ].join(" ");
+      let warmup: PwshResult | null = null;
       try {
-        const warmup = await this.execInternal(
-          "Import-Module PnP.PowerShell -ErrorAction Stop; 'pwsh-ready'",
-          30_000,
-        );
-        if (!warmup.stdout.includes("pwsh-ready")) {
-          throw new Error(`pwsh warmup unexpected output: ${warmup.stdout.slice(0, 200)}`);
+        warmup = await this.execInternal(warmupCmd, 30_000);
+        const out = warmup.stdout;
+        if (out.includes("WARMUP_OK")) {
+          // Parse the marker line for log output.
+          const line = out.split("\n").find(l => l.includes("WARMUP_OK")) ?? "";
+          const [, version, base] = line.split("|");
+          log("info", "pwsh session: ready", {
+            pnpVersion: (version ?? "").trim(),
+            pnpModuleBase: (base ?? "").trim(),
+          });
+        } else if (out.includes("WARMUP_NOT_INSTALLED")) {
+          throw new Error(
+            "PnP.PowerShell module is not installed in any PSModulePath. " +
+            "Install with: pwsh -Command \"Install-PSResource -Name PnP.PowerShell -Scope CurrentUser\" " +
+            "(or, on older pwsh: \"Install-Module -Name PnP.PowerShell -Force -AllowClobber -Scope CurrentUser\")",
+          );
+        } else if (out.includes("WARMUP_NEEDS_3X")) {
+          const detail = out.split("WARMUP_NEEDS_3X|")[1]?.split("\n")[0]?.trim() ?? "(none)";
+          throw new Error(
+            "PnP.PowerShell 3.x is required but only older versions are installed. " +
+            `Found: ${detail}. ` +
+            "Install 3.x with: pwsh -Command \"Install-PSResource -Name PnP.PowerShell -Scope CurrentUser\"",
+          );
+        } else {
+          // A2 fix: include the actual stdout AND stderr in the error so the user can see what
+          // pwsh said, instead of the previous opaque "unexpected output: ." line. Also include
+          // exit code and errorMessage if present.
+          const stdoutHint = (out || "(empty)").slice(0, 400);
+          const stderrHint = (warmup.stderr || "(empty)").slice(0, 400);
+          throw new Error(
+            "pwsh warmup did not produce expected marker. " +
+            `Exit code: ${warmup.exitCode}. ` +
+            (warmup.errorMessage ? `Error: ${warmup.errorMessage}. ` : "") +
+            `STDOUT: ${stdoutHint}. STDERR: ${stderrHint}`,
+          );
         }
       } catch (err) {
         // CRITICAL: tear down the half-initialized child so the next start() actually retries
         // instead of silently reusing a doomed process.
         try { this.child?.kill("SIGTERM"); } catch { /* noop */ }
         this.child = null;
-        throw new Error(
-          `pwsh started but PnP.PowerShell module load failed: ${(err as Error).message}. ` +
-          `Install with: pwsh -Command "Install-Module -Name PnP.PowerShell -Force -AllowClobber -Scope CurrentUser"`,
-        );
+        // A2 + A4: log the FULL warmup result to disk so users can inspect it post-mortem.
+        log("error", "pwsh session: warmup failed", {
+          message: (err as Error).message,
+          warmupStdout: (warmup?.stdout ?? "").slice(0, 1000),
+          warmupStderr: (warmup?.stderr ?? "").slice(0, 1000),
+          warmupExitCode: warmup?.exitCode ?? null,
+          warmupErrorMessage: warmup?.errorMessage ?? null,
+        });
+        throw new Error(`pwsh started but PnP.PowerShell warmup failed: ${(err as Error).message}`);
       }
-      log("info", "pwsh session: ready");
     })();
     try {
       await this.startPromise;

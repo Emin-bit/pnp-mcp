@@ -1164,7 +1164,61 @@ async function main() {
     console.log("SKIP direct stripCommentsInSnippet probe (helper not exported); covered indirectly by test 67");
   }
 
-  console.log("\nALL PHASE 0+1+2+3+4+5 SMOKE TESTS PASSED (72/72)");
+  // ---------- Phase A (1.0.1) regressions ----------
+
+  // 73. (A4) Server prints log directory to stderr at startup so users hunting for
+  // diagnostics know where to look. Claude Desktop's `mcp-server-pnp.log` is just MCP
+  // protocol traffic — our internal pwsh stderr lives in `~/.pnp-mcp/logs/`.
+  if (!stderrBuf.includes("[pnp-mcp]") || !stderrBuf.includes("logs at")) {
+    throw new Error(
+      `Server stderr should announce log directory at startup. stderr tail:\n${stderrBuf.slice(-500)}`,
+    );
+  }
+  console.log("OK server announces log directory at startup (A4 fix)");
+
+  // 74. (A1) pwsh.ts warmup is version-aware. Source-level check — we verify the
+  // warmup script picks the highest 3.x install BY PATH instead of by name (which
+  // would let a legacy 2.x in user-scope shadow a 3.x in system-scope on Windows).
+  const { readFileSync: rf } = await import("node:fs");
+  const pwshSrc = rf(resolve(__dirname, "src/pwsh.ts"), "utf8");
+  for (const needle of ["WARMUP_OK", "WARMUP_NEEDS_3X", "WARMUP_NOT_INSTALLED", "Where-Object { $_.Version.Major -ge 3 }", "Import-Module $best.Path"]) {
+    if (!pwshSrc.includes(needle)) {
+      throw new Error(`pwsh.ts warmup is missing version-aware marker '${needle}' (A1 fix incomplete)`);
+    }
+  }
+  console.log("OK pwsh.ts warmup is version-aware: picks highest 3.x by path (A1 fix)");
+
+  // 75. (A2) pwsh.ts warmup surfaces raw stdout + stderr + exit code in the error
+  // message instead of the previous opaque "unexpected output: ." line.
+  for (const needle of ["STDOUT:", "STDERR:", "warmupStdout", "warmupStderr"]) {
+    if (!pwshSrc.includes(needle)) {
+      throw new Error(`pwsh.ts is missing raw-stderr surfacing token '${needle}' (A2 fix incomplete)`);
+    }
+  }
+  console.log("OK pwsh.ts surfaces raw stdout/stderr/exit in warmup errors + log file (A2 fix)");
+
+  // 76. (A3) setup.ts tries Install-PSResource (modern, ~15× faster) before falling
+  // back to Install-Module on older pwsh.
+  const setupSrc = rf(resolve(__dirname, "src/setup.ts"), "utf8");
+  const psResourceIdx = setupSrc.indexOf("Install-PSResource");
+  const installModuleIdx = setupSrc.indexOf("Install-Module -Name", psResourceIdx === -1 ? 0 : psResourceIdx);
+  if (psResourceIdx === -1 || installModuleIdx === -1 || installModuleIdx < psResourceIdx) {
+    throw new Error(
+      `setup.ts must try Install-PSResource BEFORE Install-Module (A3 fix). Got psResourceIdx=${psResourceIdx}, installModuleIdx=${installModuleIdx}`,
+    );
+  }
+  console.log("OK setup.ts tries Install-PSResource first, falls back to Install-Module (A3 fix)");
+
+  // 77. (A6) dist/index.js wires update-notifier and respects PNP_MCP_DISABLE_UPDATE_CHECK.
+  const indexSrc = rf(resolve(__dirname, "dist/index.js"), "utf8");
+  for (const needle of ["update-notifier", "PNP_MCP_DISABLE_UPDATE_CHECK", "updateCheckInterval"]) {
+    if (!indexSrc.includes(needle)) {
+      throw new Error(`dist/index.js missing update-notifier wiring token '${needle}' (A6 fix)`);
+    }
+  }
+  console.log("OK dist/index.js wires update-notifier with 24h interval + opt-out env (A6 fix)");
+
+  console.log("\nALL PHASE 0+1+2+3+4+5+A SMOKE TESTS PASSED (77/77)");
   child.kill();
   process.exit(0);
 }
