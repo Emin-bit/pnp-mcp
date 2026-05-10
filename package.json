@@ -1,6 +1,6 @@
 {
   "name": "@emin-bit/pnp-mcp",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP (Model Context Protocol) server bridging Claude with the PnP PowerShell module for SharePoint Online and Microsoft 365 administration. Wraps `pwsh` 7+ with PnP.PowerShell module installed; exposes auth lifecycle, sites/webs/lists/files/content-types/permissions/provisioning operations as typed tools, plus a generic passthrough escape hatch.",
   "type": "module",
   "license": "MIT",

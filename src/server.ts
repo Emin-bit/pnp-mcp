@@ -1,6 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { homedir } from "node:os";
 import { z } from "zod";
+import { loadState } from "./state-cache.js";
+import { readMsalAccounts } from "./identity-cache.js";
+
+/** Render an ISO timestamp as a coarse "5m ago" / "2h ago" / "3d ago" hint. */
+function humanTimeAgo(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return iso;
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const d = Math.round(hr / 24);
+  return `${d}d ago`;
+}
 import { runAsTool } from "./runner.js";
 import { runPnp, stopSession, maskCommand, getSession } from "./pwsh.js";
 import { isDestructive, safeModeEnabled } from "./safety.js";
@@ -26,7 +43,7 @@ import { registerM365Group } from "./tools/m365group.js";
 import { registerNavigation } from "./tools/navigation.js";
 import { log, getLogDir } from "./logger.js";
 
-export const VERSION = "1.0.1";
+export const VERSION = "1.1.0";
 
 const SERVER_INSTRUCTIONS = `
 PnP MCP server (90 tools). Wraps the PnP.PowerShell module via a long-lived pwsh 7+ REPL session.
@@ -216,25 +233,78 @@ export async function startServer(): Promise<void> {
   registerM365Group(server);
   registerNavigation(server);
 
-  // -------- pnp_session_status --------
+  // -------- pnp_session_status (B3 enriched) --------
   server.tool(
     "pnp_session_status",
-    "Show the current PnP connection (if any) in the long-lived pwsh session. ALWAYS call this before destructive operations to verify which tenant/site is active. Returns: connection URL, account name, client ID, scopes — or a clear 'NOT CONNECTED' message if no auth has been performed.",
+    "Show the current PnP connection (if any) in the long-lived pwsh session. ALWAYS call this before destructive operations to verify which tenant/site is active. " +
+    "Returns: connection URL, account name, client ID, tenant ID, connection type — or a clear 'NOT CONNECTED' message if no auth has been performed. " +
+    "B3: AccountName and TenantId are eagerly populated when the connection object leaves them blank (PnP 3.x sometimes does for delegated auth). " +
+    // NOTE: the eager-load makes one extra Get-PnPWeb REST hop per status call when
+    // AccountName is blank — for app-only auth that is *every* call, since AccountName
+    // is always blank there. Cost is small (~100ms one-shot REST) but worth memoizing
+    // per-connection in a future minor if status_check turns into a hot path.
+
+    "B2: also lists the most-recent cached connections so you can re-call pnp_auth_connect_* without typing the URL/ClientId again.",
     {},
-    async () => runAsTool({
-      toolName: "pnp_session_status",
-      // Get-PnPConnection THROWS a terminating exception (BeginProcessing aborts) when no
-      // connection exists — even with -ErrorAction SilentlyContinue. We MUST wrap in try/catch
-      // inside PowerShell rather than relying on PowerShell's error-action preference.
-      command:
-        "try { " +
-          "$c = Get-PnPConnection -ErrorAction Stop; " +
-          "$c | Select-Object Url, AccountName, ClientId, ConnectionType, TenantId | Format-List | Out-String " +
-        "} catch { " +
-          "'NOT CONNECTED — call a pnp_auth_connect_* tool first' " +
-        "}",
-      timeoutMs: 15_000,
-    }),
+    async () => {
+      // First run the live status check.
+      const liveResult = await runAsTool({
+        toolName: "pnp_session_status",
+        // Get-PnPConnection THROWS a terminating exception (BeginProcessing aborts) when no
+        // connection exists — even with -ErrorAction SilentlyContinue. We MUST wrap in try/catch
+        // inside PowerShell rather than relying on PowerShell's error-action preference.
+        // B3: backfill AccountName from CurrentUser.Email when the connection leaves it blank.
+        command:
+          "try { " +
+            "$c = Get-PnPConnection -ErrorAction Stop; " +
+            "$acc = $c.AccountName; " +
+            "$tid = $c.TenantId; " +
+            "if ([string]::IsNullOrEmpty($acc)) { " +
+              "try { $w = Get-PnPWeb -Includes CurrentUser -ErrorAction Stop; if ($w.CurrentUser) { $acc = $w.CurrentUser.Email } } catch {} " +
+            "} " +
+            "[pscustomobject]@{ " +
+              "Url = $c.Url; " +
+              "AccountName = if ([string]::IsNullOrEmpty($acc)) { '(not available — likely app-only or pending first call)' } else { $acc }; " +
+              "ClientId = $c.ClientId; " +
+              "TenantId = if ([string]::IsNullOrEmpty($tid)) { '(not available)' } else { $tid }; " +
+              "ConnectionType = $c.ConnectionType " +
+            "} | Format-List | Out-String " +
+          "} catch { " +
+            "'NOT CONNECTED — call a pnp_auth_connect_* tool first' " +
+          "}",
+        timeoutMs: 15_000,
+      });
+
+      // B2: append a compact cached-connections summary so users (and Claude) can see what
+      // pnp_auth_connect_* will fall back to when called with no `url` / `client_id`.
+      const cached = loadState().lastConnections;
+      if (cached.length) {
+        const lines = ["", "--- Cached connections (B2) — pnp_auth_connect_* will reuse these when args are omitted:"];
+        cached.slice(0, 5).forEach((c, i) => {
+          const upn = c.upn ? ` as ${c.upn}` : "";
+          const tenant = c.tenantId ? `, tenant ${c.tenantId}` : "";
+          const cid = c.clientId ? `, clientId ${c.clientId.slice(0, 8)}…` : "";
+          const ago = humanTimeAgo(c.lastUsed);
+          lines.push(`  ${i + 1}. ${c.url}${upn} via ${c.authMethod} (${c.successCount}× successful, last ${ago}${tenant}${cid})`);
+        });
+        liveResult.content.push({ type: "text", text: lines.join("\n") });
+      }
+
+      // B5: append OS Identity Broker (Windows WAM) signed-in accounts. Empty on
+      // macOS/Linux. Useful when no PnP cache yet exists — Claude can derive a
+      // candidate URL from the broker's tenant default-domain mapping.
+      const msal = readMsalAccounts();
+      if (msal.length) {
+        const lines = ["", "--- Signed-in M365 accounts in OS Identity Broker (B5):"];
+        msal.slice(0, 5).forEach((a, i) => {
+          const t = a.tenantId ? ` (tenant ${a.tenantId.slice(0, 8)}…)` : "";
+          const sug = a.suggestedSpoUrls.length ? `, suggested SPO: ${a.suggestedSpoUrls[0]}` : "";
+          lines.push(`  ${i + 1}. ${a.upn ?? "(unknown UPN)"}${t}${sug}`);
+        });
+        liveResult.content.push({ type: "text", text: lines.join("\n") });
+      }
+      return liveResult;
+    },
   );
 
   // Graceful shutdown
@@ -269,7 +339,11 @@ export async function startServer(): Promise<void> {
   // pwsh stderr or our internal log lines. Print our log path to MCP-server stderr at
   // startup so users hunting for diagnostics know exactly where to look. Claude Desktop
   // captures stderr too — this line ends up in `mcp.log`, which is the right place for it.
-  process.stderr.write(`[pnp-mcp] v${VERSION} started — logs at ${getLogDir()}\n`);
+  // Privacy: replace the home-dir prefix with `~` so users can safely share their mcp.log
+  // for debugging without leaking the OS username.
+  const home = homedir();
+  const displayLogDir = getLogDir().startsWith(home) ? "~" + getLogDir().slice(home.length) : getLogDir();
+  process.stderr.write(`[pnp-mcp] v${VERSION} started — logs at ${displayLogDir}\n`);
 }
 
 // Helper for smoke-test introspection: also export a function that just runs one command

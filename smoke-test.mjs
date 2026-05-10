@@ -408,6 +408,218 @@ async function main() {
   }
   console.log("OK preflight produces structured report (node, pwsh, module, auth checks)");
 
+  // ---------- 14b. (B1) preflight surfaces effective load path for PnP module ----------
+  // The Windows UX report's #3 friction was "no way to tell which install pwsh was picking
+  // when both 2.x and 3.x were on disk". The 1.0.1 probe + 1.1.0 B1 enhancement should
+  // include a "loaded from <path>" detail line. (Dev machine has 3.x installed; if you
+  // also have 2.x in a legacy location, you'll see a "⚠ Also installed:" warning here.)
+  if (!preflightText.includes("PnP.PowerShell module") || !preflightText.includes("loaded from")) {
+    throw new Error(
+      `preflight should surface effective module load path with 'loaded from <base>' (B1 fix). Got:\n${preflightText.slice(0, 800)}`,
+    );
+  }
+  console.log("OK preflight surfaces effective module load path (B1 fix)");
+
+  // 14c. (B1) Source-level: setup.ts probePnpModule must enumerate BOTH 3.x AND legacy 2.x
+  // installs in one pass, so that on a Windows box with both versions present the user
+  // sees a clear "shadowed by 3.x" warning instead of nothing.
+  {
+    const { readFileSync: rfx } = await import("node:fs");
+    const setupSrc = rfx(resolve(__dirname, "src/setup.ts"), "utf8");
+    for (const needle of ["BEST3:", "LEGACY:", "ONLY-LEGACY", "shadowed by 3.x"]) {
+      if (!setupSrc.includes(needle)) {
+        throw new Error(`setup.ts probePnpModule missing B1 token '${needle}'`);
+      }
+    }
+  }
+  console.log("OK setup.ts probePnpModule enumerates 3.x + legacy in one pass (B1 source check)");
+
+  // 14d. (B1) Probe interface exposes a `warnings: string[]` field for non-blocking
+  // advisories. Forward-compat for B5 MSAL cache findings.
+  {
+    const { readFileSync: rfx } = await import("node:fs");
+    const setupSrc = rfx(resolve(__dirname, "src/setup.ts"), "utf8");
+    if (!setupSrc.match(/warnings\?:\s*string\[\]/)) {
+      throw new Error("Probe interface should expose warnings?: string[] (B1)");
+    }
+    if (!setupSrc.includes("\\n   ⚠ ")) {
+      throw new Error("runPreflight summary should render warnings with '⚠ ' prefix (B1)");
+    }
+  }
+  console.log("OK Probe.warnings + summary rendering wired (B1 source check)");
+
+  // ---------- 14e. Privacy: stderr startup line + log payloads redact homedir + username ----------
+  // Defense-in-depth: a user who copies their mcp.log or ~/.pnp-mcp/logs/* for debugging
+  // should not leak their OS username or home-dir path. Tests:
+  //   (a) the startup banner uses '~/.pnp-mcp/logs', not the absolute home path
+  //   (b) the logger redaction helper substitutes both homedir and username in payloads
+  if (!stderrBuf.includes("~/.pnp-mcp/logs") && !stderrBuf.includes("logs at ~")) {
+    // Only assert this when LOG_DIR is under the user's home (i.e. PNP_MCP_LOG_DIR not overridden).
+    // If the env override is set the absolute path is intentional.
+    if (!process.env.PNP_MCP_LOG_DIR) {
+      throw new Error(
+        `Privacy: server stderr startup line should display log dir as '~/.pnp-mcp/logs' (with the home prefix replaced by ~). Got stderr tail:\n${stderrBuf.slice(-400)}`,
+      );
+    }
+  }
+  console.log("OK server startup line replaces home-dir prefix with ~ (privacy)");
+
+  // 14f. Logger redaction helper: import dist/logger.js and exercise it on a known
+  // payload containing both the homedir and the username. Asserts both are redacted.
+  {
+    const loggerMod = await import(resolve(__dirname, "dist/logger.js"));
+    // Write a known sentinel and read back the last line of today's log file.
+    const sentinel = `__privacy_test_${Date.now()}__`;
+    const homePath = (await import("node:os")).homedir() + "/somefile-" + sentinel;
+    const probeUser = (await import("node:os")).userInfo().username;
+    loggerMod.log("info", `path=${homePath} user=${probeUser}`, { extra: homePath, who: probeUser });
+    // Read back today's log file.
+    const { readFileSync: rfx } = await import("node:fs");
+    const logPath = `${loggerMod.getLogDir()}/pnp-mcp-${new Date().toISOString().slice(0, 10)}.log`;
+    const tail = rfx(logPath, "utf8").trim().split("\n").slice(-1)[0];
+    if (!tail.includes(sentinel)) throw new Error(`Privacy log probe sentinel missing in last log line: ${tail}`);
+    // Username must be redacted to <user>; home-dir must collapse to ~.
+    if (probeUser && probeUser.length >= 3 && tail.toLowerCase().includes(probeUser.toLowerCase())) {
+      throw new Error(
+        `Privacy: username '${probeUser}' was NOT redacted in log line. Log: ${tail}`,
+      );
+    }
+    if (tail.includes((await import("node:os")).homedir())) {
+      throw new Error(
+        `Privacy: home-dir was NOT redacted to '~' in log line. Log: ${tail}`,
+      );
+    }
+    if (!tail.includes("~/somefile-" + sentinel)) {
+      throw new Error(`Privacy: home-dir collapse to '~' missing. Log: ${tail}`);
+    }
+  }
+  console.log("OK logger redacts homedir + username in log file payloads (privacy)");
+
+  // ---------- 14g. (B2) state-cache module: load/record/find round-trip ----------
+  // Use a temp state file via env so this test doesn't touch the user's real cache.
+  // The state-cache module reads PNP_MCP_STATE_FILE at module load time, so we have
+  // to spawn a fresh Node process with the env var set to validate the contract.
+  {
+    const { spawnSync: ssync } = await import("node:child_process");
+    const { mkdtempSync, readFileSync: rfx2 } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const tmp = mkdtempSync(resolve(tmpdir(), "pnp-mcp-state-"));
+    const stateFile = resolve(tmp, "state.json");
+    const probe = `
+      import('${resolve(__dirname, "dist/state-cache.js")}').then(m => {
+        // Empty load returns empty list, never throws.
+        const empty = m.loadState();
+        if (!empty || empty.lastConnections.length !== 0) throw new Error('empty load wrong: ' + JSON.stringify(empty));
+        // Record two distinct connects.
+        m.recordSuccessfulConnect({ url: 'https://contoso.sharepoint.com', clientId: 'cid-A', tenantId: 't1', authMethod: 'interactive' });
+        m.recordSuccessfulConnect({ url: 'https://other.sharepoint.com', clientId: 'cid-B', tenantId: 't2', authMethod: 'device_code' });
+        // Re-record first → successCount should bump to 2 and order should put cid-A first.
+        m.recordSuccessfulConnect({ url: 'https://contoso.sharepoint.com', clientId: 'cid-A', tenantId: 't1', authMethod: 'interactive', upn: 'u@contoso.com' });
+        const after = m.loadState();
+        if (after.lastConnections.length !== 2) throw new Error('expected 2 entries, got ' + after.lastConnections.length);
+        if (after.lastConnections[0].url !== 'https://contoso.sharepoint.com') throw new Error('first should be contoso, got ' + after.lastConnections[0].url);
+        if (after.lastConnections[0].successCount !== 2) throw new Error('cid-A successCount should be 2');
+        if (after.lastConnections[0].upn !== 'u@contoso.com') throw new Error('upn backfill failed');
+        // findCachedConnection by url
+        const byUrl = m.findCachedConnection({ url: 'https://other.sharepoint.com' });
+        if (!byUrl || byUrl.clientId !== 'cid-B') throw new Error('findCachedConnection url match failed');
+        // findCachedConnection bare → most recent
+        const mostRecent = m.findCachedConnection();
+        if (!mostRecent || mostRecent.clientId !== 'cid-A') throw new Error('most-recent should be cid-A');
+        // B4 BUGFIX (Phase B agent review): {authMethod} alone should return most-recent
+        // record using that method. Without this branch the headline "no args at all"
+        // case for pnp_auth_connect_interactive returned needs_input even with cache hits.
+        const byInteractive = m.findCachedConnection({ authMethod: 'interactive' });
+        if (!byInteractive || byInteractive.clientId !== 'cid-A') {
+          throw new Error('authMethod-alone hint should return most-recent of that method, got ' + JSON.stringify(byInteractive));
+        }
+        const byDeviceCode = m.findCachedConnection({ authMethod: 'device_code' });
+        if (!byDeviceCode || byDeviceCode.clientId !== 'cid-B') {
+          throw new Error('authMethod=device_code should return cid-B, got ' + JSON.stringify(byDeviceCode));
+        }
+        // authMethod with no matching record → null (no cross-pollution with other methods)
+        const noMatch = m.findCachedConnection({ authMethod: 'sp_secret' });
+        if (noMatch !== null) throw new Error('authMethod=sp_secret with no match should be null, got ' + JSON.stringify(noMatch));
+        process.stdout.write('B2-OK');
+      }).catch(e => { process.stderr.write(e.stack ?? String(e)); process.exit(1); });
+    `;
+    const r = ssync("node", ["--input-type=module", "-e", probe], {
+      env: { ...process.env, PNP_MCP_STATE_FILE: stateFile, PNP_MCP_LOG_DIR: tmp },
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    if (r.status !== 0 || !r.stdout.includes("B2-OK")) {
+      throw new Error(`B2 state-cache round-trip failed.\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    }
+    const persisted = JSON.parse(rfx2(stateFile, "utf8"));
+    if (persisted.version !== 1 || !Array.isArray(persisted.lastConnections) || persisted.lastConnections.length !== 2) {
+      throw new Error(`B2 state.json on disk has wrong shape: ${JSON.stringify(persisted)}`);
+    }
+  }
+  console.log("OK state-cache load/record/find round-trip + atomic write (B2)");
+
+  // ---------- 14h. (B4) auth tools accept omitted url/client_id when nothing cached ----------
+  // With an empty cache the tool should return an isError result that lists what's missing
+  // and explicitly mentions "No cached connections yet" so Claude can prompt the user.
+  send({
+    jsonrpc: "2.0", id: 320, method: "tools/call",
+    params: { name: "pnp_auth_connect_interactive", arguments: {} },
+  });
+  const authNoCache = await waitFor(320, 15_000);
+  const authNoCacheText = authNoCache.result?.content?.[0]?.text ?? "";
+  if (!authNoCache.result?.isError) {
+    throw new Error(`pnp_auth_connect_interactive should ERROR with empty cache + no args. Got:\n${authNoCacheText}`);
+  }
+  if (!authNoCacheText.toLowerCase().includes("needs") || !authNoCacheText.toLowerCase().includes("url")) {
+    throw new Error(`needs_input message should mention 'needs' and 'url'. Got:\n${authNoCacheText}`);
+  }
+  console.log("OK pnp_auth_connect_interactive returns clear needs_input on empty cache (B4)");
+
+  // ---------- 14i. (B5) identity-cache module: read returns array, summarizeForPreflight returns optional string ----------
+  // Validates the module loads, returns an array (empty on macOS/Linux), and the summarize
+  // helper returns either a string or undefined — no throws.
+  {
+    const idMod = await import(resolve(__dirname, "dist/identity-cache.js"));
+    const accs = idMod.readMsalAccounts();
+    if (!Array.isArray(accs)) throw new Error('readMsalAccounts should return an array');
+    const sum = idMod.summarizeForPreflight();
+    if (sum !== undefined && typeof sum !== 'string') throw new Error('summarizeForPreflight should return string|undefined');
+  }
+  console.log("OK identity-cache.ts loads, returns array (no-op on non-Win), summary helper safe (B5)");
+
+  // ---------- 14j. (B5) Probe.warnings on PnP auth probe is wired (source check) ----------
+  {
+    const { readFileSync: rfx } = await import("node:fs");
+    const setupSrc = rfx(resolve(__dirname, "src/setup.ts"), "utf8");
+    if (!setupSrc.includes("gatherMsalWarnings") || !setupSrc.includes("summarizeForPreflight")) {
+      throw new Error("setup.ts probePnpAuth should call into identity-cache for B5 warnings");
+    }
+  }
+  console.log("OK setup.ts probePnpAuth surfaces MSAL cache warnings (B5 source check)");
+
+  // ---------- 14k. (B3) pnp_session_status appends cached connections + MSAL accounts ----------
+  // We don't require a real connection here — just verify that the tool runs end-to-end and
+  // when no connection exists, it includes the NOT CONNECTED line. Cache list rendering is
+  // exercised by the source-level check below.
+  send({
+    jsonrpc: "2.0", id: 321, method: "tools/call",
+    params: { name: "pnp_session_status", arguments: {} },
+  });
+  const statusEnriched = await waitFor(321, 15_000);
+  const statusEnrichedText = statusEnriched.result?.content?.map(c => c.text).join("\n") ?? "";
+  if (!statusEnrichedText.includes("NOT CONNECTED")) {
+    throw new Error(`pnp_session_status should still report NOT CONNECTED in test env. Got:\n${statusEnrichedText.slice(0, 500)}`);
+  }
+  // Source check that the B3 enrichment + cache append path is wired.
+  {
+    const { readFileSync: rfx } = await import("node:fs");
+    const serverSrc = rfx(resolve(__dirname, "src/server.ts"), "utf8");
+    for (const needle of ["Cached connections (B2)", "Get-PnPWeb -Includes CurrentUser", "humanTimeAgo", "Identity Broker (B5)"]) {
+      if (!serverSrc.includes(needle)) throw new Error(`server.ts session_status missing B3/B5 token '${needle}'`);
+    }
+  }
+  console.log("OK pnp_session_status runs + enrichment + cache + MSAL listing wired (B3+B5)");
+
   // ---------- 15. job_list empty on fresh server ----------
   send({
     jsonrpc: "2.0", id: 301, method: "tools/call",
@@ -1218,7 +1430,7 @@ async function main() {
   }
   console.log("OK dist/index.js wires update-notifier with 24h interval + opt-out env (A6 fix)");
 
-  console.log("\nALL PHASE 0+1+2+3+4+5+A SMOKE TESTS PASSED (77/77)");
+  console.log("\nALL PHASE 0+1+2+3+4+5+A+B SMOKE TESTS PASSED (88/88)");
   child.kill();
   process.exit(0);
 }

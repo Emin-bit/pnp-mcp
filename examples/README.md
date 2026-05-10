@@ -209,7 +209,7 @@ QuickLaunch + SearchNav + Footer). The pipeline form `Get-PnPNavigationNode -Loc
 
 ```
 Create a new TeamSite at https://contoso.sharepoint.com/sites/project-x with
-alias "project-x", title "Project X", owner emin@contoso.onmicrosoft.com,
+alias "project-x", title "Project X", owner admin@contoso.onmicrosoft.com,
 public (not private).
 ```
 

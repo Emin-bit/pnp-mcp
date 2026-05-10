@@ -7,6 +7,7 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { resolvePwsh, getEffectivePath } from "./pwsh.js";
+import { summarizeForPreflight as summarizeMsalForPreflight } from "./identity-cache.js";
 
 export const PNP_PS_MODULE = "PnP.PowerShell";
 export const MIN_PWSH_MAJOR = 7;
@@ -19,6 +20,13 @@ export interface Probe {
   version?: string;
   detail?: string;
   fix?: string;
+  /**
+   * Non-blocking advisories surfaced under this probe in the preflight summary, e.g.
+   * "Also installed: 2.2.0 at <path> (legacy, shadowed)". A probe can be `status: ok`
+   * AND have warnings — the warnings inform without failing the gate. Forward-compat
+   * for Phase B MSAL cache integration.
+   */
+  warnings?: string[];
 }
 
 interface RunRes {
@@ -130,19 +138,30 @@ export async function probePnpModule(): Promise<Probe> {
   // 2.x-only install as `error`, not `ok`, so preflight stays consistent with the
   // version-aware Import-Module the warmup actually executes. Otherwise users see a
   // green preflight then a confusing WARMUP_NEEDS_3X failure when the server starts.
+  //
+  // B1: emit ALL findings — best 3.x AND every legacy 2.x install. The Windows UX
+  // report's #3 friction was that with both installed, the user had no way to tell
+  // which one would be picked or that the 2.x one was being ignored. The probe now
+  // outputs multi-line:
+  //   BEST3:<version>|<moduleBase>
+  //   LEGACY:<version>|<moduleBase>
+  //   LEGACY:<version>|<moduleBase>   (one line per legacy install)
+  //   ONLY-LEGACY                      (marker emitted iff no 3.x found)
+  // and the TS layer parses each line into either the primary detail or the warnings array.
   const bin = resolvePwsh();
   const r = await runOnce(
     bin,
     [
       "-NoProfile",
       "-Command",
-      // Emit `BEST3:<version>|<base>`, `LEGACY:<v1>;<v2>;...`, or `NONE`.
       "$all = Get-Module -ListAvailable PnP.PowerShell | Sort-Object Version -Descending; " +
       "if (-not $all) { 'NONE' } " +
       "else { " +
       "  $best3 = $all | Where-Object { $_.Version.Major -ge 3 } | Select-Object -First 1; " +
+      "  $legacy = $all | Where-Object { $_.Version.Major -lt 3 }; " +
       "  if ($best3) { 'BEST3:' + $best3.Version.ToString() + '|' + $best3.ModuleBase } " +
-      "  else { 'LEGACY:' + (($all | ForEach-Object { $_.Version.ToString() }) -join ';') } " +
+      "  foreach ($l in $legacy) { 'LEGACY:' + $l.Version.ToString() + '|' + $l.ModuleBase } " +
+      "  if (-not $best3) { 'ONLY-LEGACY' } " +
       "}",
     ],
     30_000,
@@ -160,31 +179,61 @@ export async function probePnpModule(): Promise<Probe> {
       fix: `Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser  (or older pwsh: Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser)`,
     };
   }
-  if (out.startsWith("LEGACY:")) {
-    const versions = out.slice("LEGACY:".length);
+  // Parse the multi-line output. Each line is either BEST3, LEGACY, ONLY-LEGACY, or junk.
+  const lines = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  let best: { version: string; base: string } | null = null;
+  const legacyInstalls: { version: string; base: string }[] = [];
+  let onlyLegacy = false;
+  for (const line of lines) {
+    if (line.startsWith("BEST3:")) {
+      const [version, base] = line.slice("BEST3:".length).split("|");
+      best = { version: (version ?? "").trim(), base: (base ?? "").trim() };
+    } else if (line.startsWith("LEGACY:")) {
+      const [version, base] = line.slice("LEGACY:".length).split("|");
+      legacyInstalls.push({ version: (version ?? "").trim(), base: (base ?? "").trim() });
+    } else if (line === "ONLY-LEGACY") {
+      onlyLegacy = true;
+    }
+    // Other lines (e.g. an unexpected warning preamble) are ignored.
+  }
+  if (onlyLegacy && !best) {
+    const summary = legacyInstalls.length
+      ? legacyInstalls.map(l => `${l.version} at ${l.base}`).join(", ")
+      : "(unknown versions)";
     return {
       name: "PnP.PowerShell module",
       status: "error",
-      version: versions,
-      detail: `Only legacy 2.x installed (${versions}). PnP MCP requires 3.x. The server will fail to start until 3.x is installed alongside or replaces 2.x.`,
+      version: legacyInstalls.map(l => l.version).join(", ") || undefined,
+      detail: `Only legacy 2.x installed (${summary}). PnP MCP requires 3.x. The server will fail to start until 3.x is installed alongside or replaces 2.x.`,
       fix: `Install-PSResource -Name ${PNP_PS_MODULE} -Scope CurrentUser  (PSResourceGet 1.x — modern, fast). On older pwsh: Install-Module -Name ${PNP_PS_MODULE} -Force -AllowClobber -Scope CurrentUser`,
     };
   }
-  if (out.startsWith("BEST3:")) {
-    const rest = out.slice("BEST3:".length);
-    const [version, base] = rest.split("|");
+  if (best) {
+    const warnings = legacyInstalls.map(
+      l => `Also installed: ${l.version} at ${l.base} (legacy, shadowed by 3.x)`,
+    );
     return {
       name: "PnP.PowerShell module",
       status: "ok",
-      version,
-      // Surface the on-disk path so users on Windows with both 2.x and 3.x installed know
-      // which install is being picked. Resolves UX gap from the 1.0.0 Windows test report.
-      detail: base ? `loaded from ${base.trim()}` : undefined,
+      version: best.version,
+      detail: best.base ? `loaded from ${best.base}` : undefined,
+      warnings: warnings.length ? warnings : undefined,
     };
   }
-  // Unknown output (very old pwsh / quoting glitch) — best-effort: treat as the version
-  // string itself and assume 3.x. Should never happen in practice with the new script.
+  // Unknown output (very old pwsh / quoting glitch) — best-effort: treat the trimmed
+  // output as a bare version string and assume 3.x. Should never happen in practice.
   return { name: "PnP.PowerShell module", status: "ok", version: out };
+}
+
+/**
+ * B5 advisory probe. Reads the OS Identity Broker cache (Windows only — silent
+ * empty on macOS/Linux) and emits the result as a non-blocking warning under
+ * the PnP auth probe. Helps users on a fresh-install Windows box realize they
+ * already have a signed-in M365 account that PnP can use silently.
+ */
+function gatherMsalWarnings(): string[] {
+  const summary = summarizeMsalForPreflight();
+  return summary ? [summary] : [];
 }
 
 export async function probePnpAuth(): Promise<Probe> {
@@ -201,17 +250,19 @@ export async function probePnpAuth(): Promise<Probe> {
     ],
     30_000,
   );
-  if (r.errorCode === "ENOENT") return { name: "PnP auth", status: "missing", detail: "pwsh not installed" };
-  if (r.exitCode !== 0) return { name: "PnP auth", status: "missing", detail: "no active PnP connection in fresh shell" };
+  const msalWarnings = gatherMsalWarnings();
+  if (r.errorCode === "ENOENT") return { name: "PnP auth", status: "missing", detail: "pwsh not installed", warnings: msalWarnings.length ? msalWarnings : undefined };
+  if (r.exitCode !== 0) return { name: "PnP auth", status: "missing", detail: "no active PnP connection in fresh shell", warnings: msalWarnings.length ? msalWarnings : undefined };
   const out = r.stdout.trim();
   if (out.startsWith("OK:")) {
-    return { name: "PnP auth", status: "ok", detail: `connected to ${out.slice(3)}` };
+    return { name: "PnP auth", status: "ok", detail: `connected to ${out.slice(3)}`, warnings: msalWarnings.length ? msalWarnings : undefined };
   }
   return {
     name: "PnP auth",
     status: "missing",
     detail: "no active PnP connection (use pnp_auth_connect_* tools to authenticate)",
     fix: 'Connect-PnPOnline -Url https://yourtenant.sharepoint.com -Interactive  (or use pnp_auth_connect_* MCP tools)',
+    warnings: msalWarnings.length ? msalWarnings : undefined,
   };
 }
 
@@ -230,7 +281,11 @@ export async function runPreflight(): Promise<PreflightReport> {
       const ver = p.version ? ` v${p.version}` : "";
       const det = p.detail ? ` — ${p.detail}` : "";
       const fix = p.fix ? `\n      fix: ${p.fix}` : "";
-      return `${icon} ${p.name}${ver}${det}${fix}`;
+      // B1: render any non-blocking warnings under the probe so users can see e.g.
+      // "Also installed: 2.2.0 at ... (legacy, shadowed by 3.x)" without it cluttering
+      // the headline status. Indented + ⚠ prefix to set them apart from primary detail.
+      const warns = (p.warnings ?? []).map(w => `\n   ⚠ ${w}`).join("");
+      return `${icon} ${p.name}${ver}${det}${warns}${fix}`;
     })
     .join("\n");
   return { probes, allOk, summary };
