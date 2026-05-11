@@ -2,6 +2,14 @@
 
 All notable changes to `@emin-bit/pnp-mcp` are documented in this file. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] — update-notifier stale-cache fix
+
+### Fixed
+
+- **Update banner could print a reversed version arrow immediately after a publish.** `update-notifier` populates `notifier.update` whenever its 24h-cached registry check has a result, even when the cached `latest` is no longer newer than the running `current` — so a user who installed 1.1.0 within the first cache window after publishing saw `Update available: 1.1.0 → 1.0.1` until the TTL expired. The startup wiring in `src/index.ts` now guards on `semver.gt(latest, current)` before rendering the banner. `semver` and `@types/semver` added as direct deps so the import is stable across `update-notifier`'s dependency-tree changes.
+
+[1.1.1]: https://github.com/Emin-bit/pnp-mcp/releases/tag/v1.1.1
+
 ## [1.1.0] — Phase B: smart auth + cached state + privacy hardening
 
 Drives the second half of the Windows-tester UX-report cleanup. After a successful first connect, subsequent invocations of `pnp_auth_connect_*` no longer require the user to type `url` or `client_id` — defaults come from a local state cache. Preflight and `pnp_session_status` now surface what's already known about the user's environment so Claude doesn't have to ask. Plus a defense-in-depth privacy layer that redacts `homedir()` and OS username from log payloads.

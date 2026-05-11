@@ -1430,7 +1430,17 @@ async function main() {
   }
   console.log("OK dist/index.js wires update-notifier with 24h interval + opt-out env (A6 fix)");
 
-  console.log("\nALL PHASE 0+1+2+3+4+5+A+B SMOKE TESTS PASSED (88/88)");
+  // 78. (1.1.1) dist/index.js guards the update banner with semver.gt so a stale cached check
+  //     (where latest <= current after a publish) doesn't render a reversed-arrow banner.
+  if (!indexSrc.includes("semver.gt(")) {
+    throw new Error("dist/index.js missing semver.gt guard around update-notifier banner (1.1.1 fix)");
+  }
+  if (!/from\s+["']semver["']/.test(indexSrc)) {
+    throw new Error("dist/index.js missing `from 'semver'` import (1.1.1 fix)");
+  }
+  console.log("OK dist/index.js guards update banner with semver.gt(latest, current) (1.1.1 fix)");
+
+  console.log("\nALL PHASE 0+1+2+3+4+5+A+B SMOKE TESTS PASSED (89/89)");
   child.kill();
   process.exit(0);
 }

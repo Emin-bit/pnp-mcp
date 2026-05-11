@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import updateNotifier from "update-notifier";
+import semver from "semver";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +25,10 @@ try {
       updateCheckInterval: 24 * 60 * 60 * 1000, // once per 24h
       shouldNotifyInNpmScript: true,
     });
-    if (notifier.update) {
+    // `notifier.update` is non-null whenever a registry check has cached a result — even when the
+    // cached `latest` is now <= the running `current` (stale across a publish). Explicit semver.gt
+    // avoids a reversed-arrow banner like "Update available: 1.1.0 → 1.0.1".
+    if (notifier.update && semver.gt(notifier.update.latest, notifier.update.current)) {
       const u = notifier.update;
       // Write directly to stderr (Claude Desktop captures this in mcp.log) — update-notifier's
       // default boxen banner is ANSI-decorated and assumes a TTY, so we render plain text instead.
