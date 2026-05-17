@@ -1440,7 +1440,47 @@ async function main() {
   }
   console.log("OK dist/index.js guards update banner with semver.gt(latest, current) (1.1.1 fix)");
 
-  console.log("\nALL PHASE 0+1+2+3+4+5+A+B SMOKE TESTS PASSED (89/89)");
+  // ---------- Phase G (1.2.0): self-review + tenant-safety guards ----------
+  // G1: pnp_self_review registered.
+  if (!listRes.result.tools.some(t => t.name === "pnp_self_review")) {
+    throw new Error("Phase G: pnp_self_review tool not registered");
+  }
+  console.log("OK pnp_self_review tool registered (Phase G)");
+
+  // G1: pnp_self_review actually runs and returns a structured report.
+  send({ jsonrpc: "2.0", id: 9501, method: "tools/call",
+    params: { name: "pnp_self_review", arguments: { days: 30 } } });
+  const sr = await waitFor(9501, 30_000);
+  const srText = sr.result?.content?.[0]?.text ?? "";
+  if (sr.result?.isError || !/HEADLINE|self.?review|Tool calls/i.test(srText)) {
+    throw new Error(`pnp_self_review should return a structured report. Got:\n${srText.slice(0, 300)}`);
+  }
+  console.log("OK pnp_self_review produces a structured report (Phase G)");
+
+  // G2: tenant-safety — pnp_site_remove with a wrong expected_url must HARD-BLOCK
+  // before doing anything (no active connection in test env, but the guard runs first).
+  send({ jsonrpc: "2.0", id: 9502, method: "tools/call",
+    params: { name: "pnp_site_remove", arguments: {
+      url: "https://contoso.sharepoint.com/sites/x",
+      expected_url: "https://DIFFERENT.sharepoint.com/sites/y",
+      confirm: true,
+    } } });
+  const ts = await waitFor(9502, 20_000);
+  const tsText = ts.result?.content?.[0]?.text ?? "";
+  if (!ts.result?.isError || !/TENANT-SAFETY|expected_url|NOT CONNECTED|not match/i.test(tsText)) {
+    throw new Error(`pnp_site_remove tenant-safety guard should block on expected_url mismatch. Got:\n${tsText.slice(0, 300)}`);
+  }
+  console.log("OK pnp_site_remove honors tenant-safety expected_url guard (Phase G)");
+
+  // G3: SERVER_INSTRUCTIONS carries the embedded SharePoint Golden Rules.
+  for (const needle of ["GOLDEN RULE", "provision", "expected_url", "pnp_self_review"]) {
+    if (!instructions.includes(needle)) {
+      throw new Error(`Phase G SERVER_INSTRUCTIONS missing required term: ${needle}`);
+    }
+  }
+  console.log("OK SERVER_INSTRUCTIONS embeds SharePoint Golden Rules (Phase G)");
+
+  console.log("\nALL PHASE 0+1+2+3+4+5+A+B+G SMOKE TESTS PASSED (93/93)");
   child.kill();
   process.exit(0);
 }

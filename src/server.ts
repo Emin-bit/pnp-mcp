@@ -41,9 +41,10 @@ import { registerPage } from "./tools/page.js";
 import { registerHubSite } from "./tools/hubsite.js";
 import { registerM365Group } from "./tools/m365group.js";
 import { registerNavigation } from "./tools/navigation.js";
+import { registerSelfReview } from "./tools/self_review.js";
 import { log, getLogDir } from "./logger.js";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 const SERVER_INSTRUCTIONS = `
 PnP MCP server (90 tools). Wraps the PnP.PowerShell module via a long-lived pwsh 7+ REPL session.
@@ -125,6 +126,166 @@ Page authoring:          pnp_page_add (draft) → pnp_page_set (publish:true or 
 OUTPUT — most read tools return JSON via ConvertTo-Json. ANSI escapes are stripped before
 the result reaches you. If a result is truncated or not JSON, fall back to pnp_run with
 \`Out-String -Width 200\` for raw display.
+
+╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+║  PHASE G (v1.2.0) — EMBEDDED EXPERT KNOWLEDGE FOR SHAREPOINT WORKFLOWS                         ║
+║  Added proactively (no production usage data yet). Mirrors the Power Platform MCP 1.2.0        ║
+║  Phase F "Golden Rules" approach — bake the recipes Claude needs to behave well.               ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #1 — AUTH ONCE PER SESSION, VERIFY BEFORE EVERY DESTRUCTIVE OP
+══════════════════════════════════════════════════════════════════════════════════════════════════
+At session start:
+  1. Run \`pnp_session_status\`. If it says "NOT CONNECTED", ask the user for target site URL
+     and pick the right \`pnp_auth_connect_*\` (interactive on dev laptop, device_code on
+     headless, sp_secret/sp_cert for CI). PnP MCP supports cached connections from prior
+     sessions (state-cache.json) — Claude will offer to reuse them when you call connect with
+     no args.
+  2. After the FIRST successful Connect, do NOT ask the user for credentials/ClientId/tenant
+     again for the rest of the session — the long-lived pwsh REPL keeps the auth context alive.
+     Re-call pnp_session_status to verify, do NOT re-auth gratuitously.
+
+Before EVERY destructive operation (Remove-, Set-PnPTenant, Invoke-PnPTenantTemplate, etc.):
+  - For typed tools (pnp_template_apply, pnp_tenant_set, pnp_site_remove): the Phase G hardening
+    accepts \`expected_url\` (or \`expected_tenant_substring\`). When set, the tool runs
+    Get-PnPConnection FIRST and HARD-REFUSES if the active connection doesn't match. ALWAYS
+    pass one of these for any production operation.
+  - For pnp_run passthrough: call pnp_session_status immediately before the destructive cmdlet
+    so the active site URL + tenant id appear in your reply — let the user confirm before
+    you proceed.
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #2 — TYPED TOOL vs pnp_run — PREFER TYPED FOR COMMON OPERATIONS
+══════════════════════════════════════════════════════════════════════════════════════════════════
+This MCP exposes 89 typed tools that wrap the most-used PnP cmdlets with structured schemas,
+consistent safety gating, automatic background-mode routing, and tenant-safety guards. **Prefer
+typed tools over \`pnp_run\` whenever both can do the job.**
+
+Quick mapping (cmdlet → typed tool):
+  • Get-PnPSite, Get-PnPTenantSite     →  pnp_site_get, pnp_site_list, pnp_site_get_by_url
+  • Get-PnPList, Get-PnPListItem       →  pnp_list_get, pnp_listitem_list
+  • Add-PnPListItem, Set-PnPListItem   →  pnp_listitem_add, pnp_listitem_set
+  • Get-PnPFile, Add-PnPFile           →  pnp_file_get, pnp_file_add
+  • Get-PnPFolder, Add-PnPFolder       →  pnp_folder_get, pnp_folder_add
+  • Get-PnPField, Add-PnPField         →  pnp_field_get, pnp_field_add
+  • Get-PnPContentType, Add-PnP*       →  pnp_contenttype_*
+  • Get-PnPGroup, Add-PnPGroupMember   →  pnp_group_*, pnp_role_set_*
+  • Invoke-PnPSiteTemplate             →  pnp_template_apply  (has tenant-safety guard)
+  • Set-PnPTenant                       →  pnp_tenant_set      (has tenant-safety guard)
+  • Remove-PnPTenantSite                →  pnp_site_remove     (has tenant-safety guard)
+  • Get-PnPHubSite, Register-PnPHubSite →  pnp_hubsite_*
+  • Get-PnPMicrosoft365Group            →  pnp_m365group_*
+  • Get-PnPPage, Set-PnPPage            →  pnp_page_*
+  • Get-PnPNavigationNode               →  pnp_navigation_*
+
+Use \`pnp_run\` only when:
+  • The cmdlet has no typed wrapper (e.g. RUN-PnPSearchQuery, Invoke-PnPGraphMethod).
+  • You need a multi-cmdlet pipeline that doesn't fit a single typed tool.
+  • You're prototyping an exploration that will become a typed tool later.
+
+Why prefer typed: typed tools surface required params in the schema (less guessing), apply
+consistent safety/confirm gating, route to background mode when historically slow, and (for the
+3 destructive ones above) verify the active connection before running.
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #3 — SITE PROVISIONING RECIPE (TeamSite vs CommunicationSite vs Group-less)
+══════════════════════════════════════════════════════════════════════════════════════════════════
+Three site templates serve different purposes; picking the wrong one is hard to undo (the
+underlying group membership and Teams/M365 relationship is baked at creation):
+
+  TeamSite (with M365 Group)         →  GROUP#0 base. Creates: SP site + M365 group + (optional) Teams
+                                        team + Group mailbox + Planner + Stream channel. Use when you
+                                        need group membership and Teams chat. CANNOT be "ungrouped".
+                                        Required: alias (short name, lowercase, no spaces). Owners
+                                        optional (defaults to the connecting identity).
+
+  TeamSiteWithoutMicrosoft365Group   →  STS#3. Plain SP site with classic SP permissions only.
+                                        No M365 group, no Teams. Use when group is undesirable
+                                        (long-term archive, vendor portal). CAN be upgraded to
+                                        group-connected later. Required: url + owner.
+
+  CommunicationSite                   →  SITEPAGEPUBLISHING#0. Branded, broadcast-style site
+                                        (no Teams team, no group). Use for company intranet,
+                                        knowledge bases, news hubs. Required: url + owner.
+                                        DOES NOT accept the \`alias\` param (typed tool blocks it).
+
+Typed tool: \`pnp_site_new\` cross-validates these — passing alias to CommunicationSite or url to
+TeamSite is rejected before the cmdlet runs.
+
+PROVISION FLOW (always):
+  1. pnp_session_status                         → confirm active tenant + admin scope
+  2. pnp_tenant_get                             → check sharing-cap defaults (will the new site
+                                                  inherit external-sharing settings you don't want?)
+  3. pnp_site_new (background:true)             → 3-8 min provisioning, returns job id
+  4. job_wait <id>                              → block until done
+  5. pnp_auth_connect_interactive (new url)     → switch context to the new site
+  6. pnp_template_apply (expected_url: <new>)   → if applying a starter template
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #4 — LIST + ITEM OPERATIONS (the hottest workflow surface)
+══════════════════════════════════════════════════════════════════════════════════════════════════
+  • CAML query vs OData filter: prefer OData (\`-Filter \"<field> eq 'value'\"\` on Get-PnPListItem)
+    for simple lookups — it's faster and easier to debug. Use CAML when you need view-fields, sort,
+    or complex AND/OR nesting.
+  • Bulk Set-PnPListItem in a pipeline (\`Get-PnPListItem | Set-PnPListItem -Values @{...}\`) can
+    hit thousands of rows in one call. The MCP safety walks the whole pipeline and gates on
+    confirm:true — this is intentional, not an annoyance.
+  • Get-PnPListItem -PageSize: default is 100. Use -PageSize 5000 for large lists or you'll
+    paginate forever. Set top-level result limit with -Top.
+  • Adding items with lookup or person fields: pass the lookup ID as a hashtable value, e.g.
+    \`-Values @{LookupCol = 42; PersonCol = "user@contoso.com"}\`. The MCP \`psHashtable\` helper
+    handles arrays for multi-value fields.
+  • DELETE: Get-PnPListItem | Remove-PnPListItem -Recycle is the safe pattern. Default goes to
+    site recycle bin (93-day recovery). -SkipRecycleBin permanent deletes.
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #5 — PERMISSIONS + INHERITANCE GOTCHAS
+══════════════════════════════════════════════════════════════════════════════════════════════════
+SharePoint permissions are scope-hierarchical: SiteCollection → Web → List → ListItem/Folder.
+Children INHERIT by default. Breaking inheritance creates a UNIQUE permission scope, which:
+  • Slows down search indexing (each unique scope = separate ACL evaluation).
+  • Creates "Limited Access" permission rows on parent scopes — a feature, not a bug.
+  • CANNOT be undone surgically: re-inheriting drops ALL custom permissions silently.
+
+Typed tools: \`pnp_role_set_web\`, \`pnp_role_set_list\`, \`pnp_role_set_listitem\` handle both
+break-inheritance and grant in one call. They reject incoherent combinations (e.g. \`user\` +
+\`group\` together — pass exactly one principal type).
+
+CRITICAL DON'T: never call Add-PnPSiteCollectionAdmin without first running pnp_session_status
+and confirming the target site. This grants UNRESTRICTED control over the entire site collection.
+There's no typed wrapper — only pnp_run, with safety gating.
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #6 — PROVISIONING TEMPLATES + DESTRUCTIVE BLAST RADIUS
+══════════════════════════════════════════════════════════════════════════════════════════════════
+\`pnp_template_apply\` (wraps Invoke-PnPSiteTemplate / Invoke-PnPTenantTemplate) is the SINGLE
+LARGEST blast-radius operation in the entire PnP module. A template can:
+  • Create or DELETE content types, fields, lists, libraries, pages.
+  • Reset navigation, theme, branding.
+  • Reset security groups + role assignments.
+  • Apply property bag values that the framework can't easily revert.
+
+ALWAYS for production applies:
+  1. \`pnp_template_apply\` accepts \`expected_url\` (Phase G hardening) — pass it. The tool runs
+     Get-PnPConnection first and refuses if the active site doesn't match.
+  2. Use \`handlers\`/\`exclude_handlers\` to limit which template sections run. For incremental
+     rollout: apply Navigation first, verify, then Fields, then ContentTypes, etc.
+  3. Run \`background:true\` (the default) — synchronous apply almost always exceeds Claude
+     Desktop's 60s MCP transport timeout. Track via job_wait.
+
+══════════════════════════════════════════════════════════════════════════════════════════════════
+GOLDEN RULE #7 — PERIODIC SELF-REVIEW
+══════════════════════════════════════════════════════════════════════════════════════════════════
+Call \`pnp_self_review\` periodically (weekly) to surface:
+  • Tool frequency + failure rate (with stderr extracts).
+  • Top PnP cmdlets called via pnp_run + their workflow families (Sites / Lists / Files / etc.).
+  • Typed vs passthrough usage ratio — if you're 95% passthrough, Claude isn't using the typed
+    wrappers (golden rule #2). The tool surfaces this as a suggestion.
+  • Connect-PnPOnline attempt count — zero attempts + many calls suggests reuse of a stale
+    cached connection.
+  • Week-over-week trend.
+Output is local-only and homedir/username redacted, safe to paste into chat or GitHub issues.
 `.trim();
 
 export async function startServer(): Promise<void> {
@@ -232,6 +393,7 @@ export async function startServer(): Promise<void> {
   registerHubSite(server);
   registerM365Group(server);
   registerNavigation(server);
+  registerSelfReview(server);
 
   // -------- pnp_session_status (B3 enriched) --------
   server.tool(

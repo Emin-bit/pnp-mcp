@@ -1,7 +1,7 @@
 {
   "name": "@emin-bit/pnp-mcp",
-  "version": "1.1.1",
-  "description": "MCP (Model Context Protocol) server bridging Claude with the PnP PowerShell module for SharePoint Online and Microsoft 365 administration. Wraps `pwsh` 7+ with PnP.PowerShell module installed; exposes auth lifecycle, sites/webs/lists/files/content-types/permissions/provisioning operations as typed tools, plus a generic passthrough escape hatch.",
+  "version": "1.2.0",
+  "description": "MCP (Model Context Protocol) server bridging Claude with the PnP PowerShell module for SharePoint Online and Microsoft 365 administration. Wraps `pwsh` 7+ with PnP.PowerShell module installed; exposes 91 typed tools (auth lifecycle, sites/webs/lists/files/content-types/permissions/provisioning/pages/hubs/m365groups/navigation), plus a generic passthrough escape hatch, plus pnp_self_review for log mining. Hardened destructive tools with opt-in expected_url guard refuse to run when the active PnP connection is pointing to a different site. SERVER_INSTRUCTIONS embeds the SharePoint admin recipes, common-pitfall cheatsheet, and tenant-safety golden rules.",
   "type": "module",
   "license": "MIT",
   "author": "Emin Mujabašić",

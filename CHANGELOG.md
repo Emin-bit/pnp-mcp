@@ -2,6 +2,33 @@
 
 All notable changes to `@emin-bit/pnp-mcp` are documented in this file. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — Phase G: proactive embedded knowledge + tenant safety + self-review
+
+PnP MCP has had zero real production usage so far (log mining: 3,747 entries, all dev-time smoke tests, 0 `Connect-PnPOnline` calls ever). Phase G is therefore PROACTIVE — it mirrors the battle-tested Phase F work from the sibling `@emin-bit/power-platform-mcp@1.2.0` into the PnP world, to pre-empt the same class of mistakes (wrong-tenant operations, no embedded workflow knowledge) before real SharePoint work begins. No breaking changes; all guards are opt-in.
+
+### Added
+
+- **`pnp_self_review`** — local log-mining tool. Mines `~/.pnp-mcp/logs/`: tool frequency, failure rate with stderr extracts, session inference (1h gap), week-over-week trend, heuristic suggestions. Pure-local, no network, homedir/username already redacted by the 1.1.0 logger. Direct port of the agent-reviewed `pp_self_review` from power-platform-mcp.
+- **`src/tenant-safety.ts`** — shared `verifyPnpConnection()` pre-flight guard. Opt-in via `expected_url` (EXACT origin+path match against the live `Get-PnPConnection`, not substring — prevents `contoso` vs `contoso-dev` confusion) or `expected_tenant_substring` (min 4 chars, case-insensitive). **Fails CLOSED** on every uncertain path: no connection, parse failure, non-zero exit, unparseable expected_url, empty active URL. Wired into three destructive tools:
+  - `pnp_site_remove` — auto-derives expected origin (host only, NOT path) from the target `url`, so removing a site while connected to the `-admin` site or tenant root is not false-blocked; only cross-tenant origin mismatches are refused.
+  - `pnp_template_apply` — accepts `expected_url` / `expected_tenant_substring`.
+  - `pnp_tenant_set` — accepts `expected_tenant_substring` (tenant-wide setting changes).
+
+### Changed
+
+- **`SERVER_INSTRUCTIONS`** expanded ~5.5K → ~17K chars with embedded SharePoint Golden Rules: auth-once-per-session, site provisioning recipe (TeamSite `GROUP#0` vs CommunicationSite `SITEPAGEPUBLISHING#0` vs TeamSiteWithoutMicrosoft365Group `STS#3`), list bulk-op safety, permission inheritance gotchas (re-inherit drops all custom permissions), provisioning template idempotency, a concrete cmdlet→typed-tool selection rule (log mining showed 96% of usage bypassed typed tools — the rule actively steers Claude back to them), and periodic self-review.
+- VERSION 1.1.1 → 1.2.0.
+
+### Tests
+
+4 new smoke assertions (93/93 total): `pnp_self_review` registered + produces a structured report, `pnp_site_remove` honors the tenant-safety guard, SERVER_INSTRUCTIONS embeds the Golden Rules. Full suite runs in ~7s on a healthy system.
+
+### Notes
+
+- Agent-reviewed. All safety-critical paths verified: guard fails closed, exact-origin comparison blocks lookalike tenants, `pnp_site_remove` auto-derive correctly scoped to origin (no path false-blocks).
+
+[1.2.0]: https://github.com/Emin-bit/pnp-mcp/releases/tag/v1.2.0
+
 ## [1.1.1] — update-notifier stale-cache fix
 
 ### Fixed

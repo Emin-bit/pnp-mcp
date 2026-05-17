@@ -159,7 +159,7 @@ export function registerTemplate(server: McpServer) {
     "Apply a PnP provisioning template (XML/PNP file) to the CURRENT connected site. " +
     "DESTRUCTIVE: creates/modifies content types, fields, lists, pages, security, etc. — read the template carefully first. " +
     "Long-running (typically 5-30 min for non-trivial templates). Defaults to background=true since synchronous apply almost always exceeds the MCP transport timeout. " +
-    "Requires confirm=true.",
+    "Phase G (1.2.0): tenant-safety — when `expected_url` is provided, this tool runs Get-PnPConnection FIRST and refuses if the active connection points to a different site. This is the single most destructive operation in the entire PnP module; ALWAYS pass expected_url for any production apply.",
     {
       path: z.string().describe("Local path to the template (.xml or .pnp file)"),
       parameters: z.record(z.string()).optional().describe(
@@ -190,6 +190,15 @@ export function registerTemplate(server: McpServer) {
         "When background=false, max minutes to block synchronously. Capped at 10 — anything longer MUST run in background mode. Default 5.",
       ),
       confirm: z.boolean(),
+      expected_url: z.string().optional().describe(
+        "Phase G tenant-safety: full target site URL (e.g. 'https://contoso.sharepoint.com/sites/marketing'). " +
+        "When set, the tool runs Get-PnPConnection first and refuses to apply unless the active connection's " +
+        "Url matches by origin AND path. STRONGLY RECOMMENDED for any production template apply.",
+      ),
+      expected_tenant_substring: z.string().optional().describe(
+        "Phase G tenant-safety: substring to match against the active connection (Url|Account|ClientId|TenantId). " +
+        "Use when you know the tenant but not the exact site path. Min 4 chars.",
+      ),
     },
     async (a): Promise<ToolResult> => {
       if (!a.confirm) {
@@ -200,9 +209,22 @@ export function registerTemplate(server: McpServer) {
             text:
               "BLOCKED: pnp_template_apply MODIFIES the connected site (creates/changes content types, fields, lists, pages, security). " +
               "Re-call with confirm=true after pnp_session_status verifies the target site. " +
-              "Strongly recommend testing on a sandbox site first.",
+              "STRONGLY RECOMMENDED: also pass `expected_url` so the tool can verify the active connection " +
+              "BEFORE applying. Strongly recommend testing on a sandbox site first.",
           }],
         };
+      }
+
+      // Phase G tenant-safety pre-flight.
+      if (a.expected_url || a.expected_tenant_substring) {
+        const { verifyPnpConnection } = await import("../tenant-safety.js");
+        const check = await verifyPnpConnection("pnp_template_apply", {
+          expected_url: a.expected_url,
+          expected_tenant_substring: a.expected_tenant_substring,
+        });
+        if (!check.ok) {
+          return { isError: true, content: [{ type: "text", text: check.blockMessage }] };
+        }
       }
       const parts = [`Invoke-PnPSiteTemplate -Path ${psQuote(a.path)}`];
       if (a.parameters && Object.keys(a.parameters).length) {

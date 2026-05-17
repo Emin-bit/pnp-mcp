@@ -132,6 +132,14 @@ export function registerTenant(server: McpServer) {
       ),
       enable_auto_expiration_version_trim: z.boolean().optional(),
       confirm: z.boolean(),
+      expected_tenant_substring: z.string().optional().describe(
+        "Phase G tenant-safety: substring of the active connection (tenant id, account UPN, or admin URL) " +
+        "that MUST be present, otherwise the change is refused. STRONGLY RECOMMENDED for production " +
+        "tenant-policy changes — these are TENANT-WIDE and irreversible at the policy level. Min 4 chars.",
+      ),
+      expected_url: z.string().optional().describe(
+        "Phase G tenant-safety: alternative to expected_tenant_substring — full admin URL match.",
+      ),
     },
     async (a): Promise<ToolResult> => {
       if (!a.confirm) {
@@ -139,9 +147,26 @@ export function registerTenant(server: McpServer) {
           isError: true,
           content: [{
             type: "text",
-            text: "BLOCKED: pnp_tenant_set changes tenant-wide SharePoint policy. Re-call with confirm=true after pnp_tenant_get confirms current state and pnp_session_status confirms the target tenant.",
+            text:
+              "BLOCKED: pnp_tenant_set changes TENANT-WIDE SharePoint policy. A wrong sharing-cap or " +
+              "anonymous-link change can lock out external collaborators across the whole tenant. " +
+              "Re-call with confirm=true after pnp_tenant_get confirms current state. " +
+              "STRONGLY RECOMMENDED: pass `expected_tenant_substring` (e.g. tenant id fragment) so the tool " +
+              "verifies the active connection BEFORE applying the change.",
           }],
         };
+      }
+
+      // Phase G tenant-safety pre-flight (tenant-wide policy changes are the highest blast radius).
+      if (a.expected_url || a.expected_tenant_substring) {
+        const { verifyPnpConnection } = await import("../tenant-safety.js");
+        const check = await verifyPnpConnection("pnp_tenant_set", {
+          expected_url: a.expected_url,
+          expected_tenant_substring: a.expected_tenant_substring,
+        });
+        if (!check.ok) {
+          return { isError: true, content: [{ type: "text", text: check.blockMessage }] };
+        }
       }
 
       // Build the Set-PnPTenant command from provided params

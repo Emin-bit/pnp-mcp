@@ -253,7 +253,8 @@ export function registerSite(server: McpServer) {
     "pnp_site_remove",
     "Remove a SharePoint Online site via Remove-PnPTenantSite. DESTRUCTIVE: site goes to recycle bin (or is permanently deleted if `skip_recycle_bin=true`). Requires confirm=true. " +
     "Removing a Microsoft 365 Group-connected site (TeamSite) ALSO triggers group + Teams team deletion — verify carefully. " +
-    "Long-running on backend; set background=true if you don't need to wait.",
+    "Long-running on backend; set background=true if you don't need to wait. " +
+    "Phase G (1.2.0): tenant-safety — pass `expected_tenant_substring` so the tool refuses if the active connection is on a different tenant than you think.",
     {
       url: z.string().describe("Full site URL"),
       skip_recycle_bin: z.boolean().default(false).describe("PERMANENT delete — bypasses 93-day recycle bin retention."),
@@ -262,15 +263,20 @@ export function registerSite(server: McpServer) {
       ),
       background: z.boolean().default(false),
       confirm: z.boolean(),
+      expected_tenant_substring: z.string().optional().describe(
+        "Phase G tenant-safety: substring of the active connection (tenant id, account UPN, or admin URL) " +
+        "that MUST be present, otherwise the deletion is refused. STRONGLY RECOMMENDED for production sites. Min 4 chars.",
+      ),
     },
-    async ({ url, skip_recycle_bin, from_recycle_bin, background, confirm }): Promise<ToolResult> => {
+    async ({ url, skip_recycle_bin, from_recycle_bin, background, confirm, expected_tenant_substring }): Promise<ToolResult> => {
       if (!confirm) {
         return {
           isError: true,
           content: [{
             type: "text",
             text: `BLOCKED: pnp_site_remove deletes a SharePoint site${skip_recycle_bin ? " PERMANENTLY (no recycle bin)" : " (to recycle bin, 93-day retention)"}. ` +
-              `Re-call with confirm=true. Run pnp_session_status first to verify the active tenant.`,
+              `Re-call with confirm=true. Run pnp_session_status first to verify the active tenant. ` +
+              `STRONGLY RECOMMENDED: also pass \`expected_tenant_substring\` so the MCP can verify the active connection BEFORE deleting.`,
           }],
         };
       }
@@ -279,6 +285,25 @@ export function registerSite(server: McpServer) {
           isError: true,
           content: [{ type: "text", text: "skip_recycle_bin and from_recycle_bin are mutually exclusive. Use one or the other." }],
         };
+      }
+
+      // Phase G tenant-safety pre-flight. NOTE: also try to derive expected origin from the
+      // target `url` itself — even when caller doesn't pass expected_*, the destination URL
+      // hints at the tenant; cross-check it against the active connection origin.
+      const tsArgs: { expected_tenant_substring?: string; expected_url?: string } = {};
+      if (expected_tenant_substring) tsArgs.expected_tenant_substring = expected_tenant_substring;
+      // Derive expected admin/site-hostname from target url so we catch cross-tenant
+      // mistakes even when the caller forgot to pass expected_*. Only compares ORIGIN.
+      try {
+        const u = new URL(url);
+        tsArgs.expected_url = `${u.protocol}//${u.host}`;
+      } catch { /* if url is malformed, let Remove-PnPTenantSite fail with a clear error */ }
+      if (tsArgs.expected_tenant_substring || tsArgs.expected_url) {
+        const { verifyPnpConnection } = await import("../tenant-safety.js");
+        const check = await verifyPnpConnection("pnp_site_remove", tsArgs);
+        if (!check.ok) {
+          return { isError: true, content: [{ type: "text", text: check.blockMessage }] };
+        }
       }
       const parts: string[] = [
         `Remove-PnPTenantSite -Url ${psQuote(url)} -Force`,
